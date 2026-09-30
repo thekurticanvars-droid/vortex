@@ -62,6 +62,19 @@ Everything not listed here is byte-for-byte the v9.1 logic.
         Open trades of a disabled pair are still monitored to completion.
   NEWS_CURRENCIES unchanged ({"USD","EUR","GBP"}) — gold is driven by USD news.
 
+HOTFIX v9.2.1 (after the first live day, 2026-09-29 log)
+  [A-3a] Gold basis is now measured on MATCHED 1-minute bars: median of
+        (Twelve Data 1min close − GC=F 1min close) over the last ≤10 minutes
+        closed on both feeds. The live log showed the unmatched method jumping
+        $1–12 per scan because Yahoo's feed lags; that lag now cancels out.
+        Cost: +1 credit per scan (Twelve Data 1min candles) ≈ +40/day.
+        Yahoo lag is logged every scan and shown in /status.
+  [A-3b] Price monitor window is bar-based (per-trade last_bar_ts) instead of
+        wall-clock: bars that a lagging feed delivers late are no longer
+        skipped (v9.1 window silently dropped them → missed wicks).
+        Applies to all pairs; for a real-time feed the result is identical.
+  Logging goes to stdout (Railway showed every INFO line as "error").
+
 v9.2 MIGRATION (run once, safe to re-run) — in addition to the v9.1 SQL below:
 alter table trades         add column if not exists weekly_conflict boolean default false;
 alter table shadow_signals add column if not exists weekly_conflict boolean default false;
@@ -200,6 +213,7 @@ Environment variables (all optional):
 
 import copy
 import hashlib
+import sys
 import html
 import json
 import logging
@@ -217,6 +231,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,   # Railway tags stderr lines as "error"; INFO belongs on stdout
 )
 log = logging.getLogger(__name__)
 
@@ -225,7 +240,7 @@ log = logging.getLogger(__name__)
 #  SECTION 1 — ENVIRONMENT & GLOBAL CONFIG
 # ═════════════════════════════════════════════════════════════════════════════
 
-STRATEGY_VERSION = "v9.2"
+STRATEGY_VERSION = "v9.2"   # v9.2.1 hotfix: matched-minute gold basis
 
 TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "")
 TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN", "")
@@ -1189,44 +1204,105 @@ def _basis_alert_once(pair_key: str, deviation: float, spot: float, corrected: f
                   f"SL/TP monitoring may be less precise until the next scan re-measures it. "
                   f"(Possible causes: futures roll, delayed Yahoo feed, fast market.)")
 
-def update_basis(pair_key: str, spot: float, fut: float, source: str) -> float | None:
+def update_basis_value(pair_key: str, basis: float, source: str, spot: float = 0.0,
+                       fut: float = 0.0, info: str = "", yahoo_delay_min: float | None = None
+                       ) -> float | None:
     """
-    Store basis = spot − futures. Returns the sanity deviation measured with
-    the PREVIOUS basis (|fut + old_basis − spot|), or None on first measurement.
+    Store a basis (spot − futures). Returns the sanity deviation vs the
+    PREVIOUS basis (= |fut + old_basis − spot|), or None on first measurement.
     """
-    if not spot or not fut or spot <= 0 or fut <= 0: return None
     now = time.time()
     with basis_lock:
         prev = _basis.get(pair_key)
-        _basis[pair_key] = {"basis": spot - fut, "ts": now, "spot": spot,
-                            "fut": fut, "source": source}
+        _basis[pair_key] = {"basis": basis, "ts": now, "spot": spot, "fut": fut,
+                            "source": source, "yahoo_delay_min": yahoo_delay_min}
+    tag = f" {info}" if info else ""
     if prev is None:
-        log.info(f"[Basis] {pair_key} initial basis {spot - fut:+.2f} (spot {spot:.2f}, fut {fut:.2f})")
+        log.info(f"[Basis] {pair_key} initial basis {basis:+.2f} [{source}]{tag}")
         return None
-    corrected = fut + prev["basis"]
-    deviation = abs(corrected - spot)
-    log.info(f"[Basis] {pair_key} basis {spot - fut:+.2f} (prev {prev['basis']:+.2f}, "
-             f"age {int((now - prev['ts'])/60)}m) deviation ${deviation:.2f} [{source}]")
+    deviation = abs(basis - prev["basis"])
+    log.info(f"[Basis] {pair_key} basis {basis:+.2f} (prev {prev['basis']:+.2f}, "
+             f"age {int((now - prev['ts'])/60)}m) deviation ${deviation:.2f} [{source}]{tag}")
     if deviation > BASIS_ALERT_USD:
-        _basis_alert_once(pair_key, deviation, spot, corrected)
+        ref = spot if spot else 0.0
+        _basis_alert_once(pair_key, deviation, ref, (fut + prev["basis"]) if fut else 0.0)
     return deviation
 
-def get_basis(pair_key: str, fut_last: float | None = None) -> float | None:
+def update_basis(pair_key: str, spot: float, fut: float, source: str) -> float | None:
+    """Unmatched fallback: basis = spot − futures from two 'current' prices."""
+    if not spot or not fut or spot <= 0 or fut <= 0: return None
+    return update_basis_value(pair_key, spot - fut, source, spot=spot, fut=fut)
+
+# [A-3 fix, v9.2.1] Matched-minute basis. Yahoo's GC=F feed can lag real time,
+# so "TD price now − GC=F price now" mixes the basis with the price move during
+# the lag (live log 2026-09-29: basis jumped $1–12 every 15 min). Instead the
+# basis is the MEDIAN of (TD close − GC=F close) over the most recent 1-minute
+# bars that BOTH feeds have closed — same minute, so the lag cancels out.
+BASIS_MATCH_MINUTES = 10
+BASIS_MATCH_MIN     = 3
+
+def _matched_basis(td_1m: list, yf_bars: list) -> tuple[float | None, int]:
+    if not td_1m or not yf_bars: return None, 0
+    td = {}
+    for c in td_1m:
+        t = _parse_ts(c.get("time"))
+        if t: td[int(t.timestamp() // 60)] = c["close"]
+    yf = {int(b[0] // 60): b[3] for b in yf_bars if b[3] > 0}
+    if not td or not yf: return None, 0
+    upto = min(max(td), max(yf)) - 1                  # minutes closed on BOTH feeds
+    common = sorted(m for m in td if m in yf and m <= upto)[-BASIS_MATCH_MINUTES:]
+    if len(common) < BASIS_MATCH_MIN: return None, len(common)
+    diffs = sorted(td[m] - yf[m] for m in common)
+    k = len(diffs)
+    med = diffs[k // 2] if k % 2 else (diffs[k // 2 - 1] + diffs[k // 2]) / 2
+    return med, k
+
+def _yahoo_delay_min(yf_bars) -> float | None:
+    if not yf_bars: return None
+    return max(0.0, (time.time() - (yf_bars[-1][0] + 60)) / 60)   # bar close → now
+
+def _measure_matched(pair_key: str, yf_bars: list, source: str) -> bool:
     """
-    Current basis. If it is older than BASIS_REFRESH_SEC and we have a fresh
-    futures price, re-measure from Twelve Data /price (throttled per pair).
+    1 Twelve Data credit (1min candles), NON-blocking: if the per-minute budget
+    is spent, the previous basis is kept (never delays the scan).
+    Returns True if a matched basis was stored.
+    """
+    if not _td_acquire(block=False):
+        log.info(f"[Basis] {pair_key} no credit free this minute – keeping previous basis")
+        return False
+    td_1m = fetch_candles(pair_key, "1min", 30, acquire=False)
+    b, n = _matched_basis(td_1m, yf_bars)
+    delay = _yahoo_delay_min(yf_bars)
+    dtxt = f"yahoo_delay={delay:.1f}m" if delay is not None else "yahoo_delay=?"
+    if b is None:
+        log.warning(f"[Basis] {pair_key} matched basis unavailable (common minutes={n}, {dtxt})")
+        return False
+    spot = td_1m[-1]["close"] if td_1m else 0.0
+    update_basis_value(pair_key, b, source, spot=spot, fut=yf_bars[-1][3],
+                       info=f"n={n} {dtxt}", yahoo_delay_min=delay)
+    return True
+
+def get_basis(pair_key: str, yf_bars: list | None = None) -> float | None:
+    """
+    Current basis. If it is older than BASIS_REFRESH_SEC (e.g. an open trade
+    outside the scan window), re-measure with the matched-minute method
+    (1 Twelve Data credit, throttled per pair).
     """
     with basis_lock:
         entry = dict(_basis[pair_key]) if pair_key in _basis else None
         last_td = _basis_td_last.get(pair_key, 0.0)
     now = time.time()
-    if (entry is None or now - entry["ts"] > BASIS_REFRESH_SEC) and fut_last \
-            and now - last_td >= BASIS_REFRESH_SEC:
+    if (entry is None or now - entry["ts"] > BASIS_REFRESH_SEC) and yf_bars \
+            and now - last_td >= BASIS_REFRESH_SEC and _td_acquire(block=False):
         with basis_lock:
             _basis_td_last[pair_key] = now
-        spot = fetch_price_twelvedata(pair_key)
-        if spot:
-            update_basis(pair_key, spot, fut_last, "monitor/td")
+        td_1m = fetch_candles(pair_key, "1min", 30, acquire=False)
+        b, n = _matched_basis(td_1m, yf_bars)
+        if b is not None:
+            d = _yahoo_delay_min(yf_bars)
+            update_basis_value(pair_key, b, "monitor/matched",
+                               spot=td_1m[-1]["close"], fut=yf_bars[-1][3],
+                               info=f"n={n}", yahoo_delay_min=d)
             with basis_lock:
                 entry = dict(_basis[pair_key])
     if entry is None: return None
@@ -1246,7 +1322,7 @@ def _basis_snapshot(symbol) -> tuple[float | None, list | None, str]:
     """[A-3] Spot-equivalent snapshot for a basis pair."""
     bars = fetch_bars_yfinance(symbol)
     if bars and bars[-1][3] > 0:
-        b = get_basis(symbol, bars[-1][3])
+        b = get_basis(symbol, bars)
         if b is not None:
             adj = [(t, h + b, l + b, c + b) for (t, h, l, c) in bars]
             last = adj[-1][3]
@@ -1261,7 +1337,7 @@ def _basis_snapshot(symbol) -> tuple[float | None, list | None, str]:
             bot_state["last_price"][symbol] = price
             bot_state["price_monitor_ok"]   = True
             bot_state["price_source"]       = "twelvedata"
-        return price, [(time.time(), price, price, price)], "twelvedata"
+        return price, None, "twelvedata"     # no bars → hi/lo = last (same as v9.1)
     return None, None, "none"
 
 def measure_basis_at_scan(pair_key: str, ec: list) -> float | None:
@@ -1280,7 +1356,8 @@ def measure_basis_at_scan(pair_key: str, ec: list) -> float | None:
         return spot
     bars = fetch_bars_yfinance(pair_key)
     if bars and bars[-1][3] > 0:
-        update_basis(pair_key, spot, bars[-1][3], "scan")
+        if not _measure_matched(pair_key, bars, "scan/matched"):
+            log.warning(f"[Basis] {pair_key} keeping previous basis (no matched minutes)")
     else:
         log.warning(f"[Basis] {pair_key} GC=F unavailable – basis not re-measured")
     return spot
@@ -1311,14 +1388,22 @@ def get_current_price(symbol):
     price, _, src = get_price_snapshot(symbol)
     return price, src
 
-def _window_hilo(bars, since_ts: float, last: float, strict: bool) -> tuple[float, float]:
+def _window_hilo(bars, since_ts: float, last: float, strict: bool,
+                 last_bar_ts: float | None = None) -> tuple[float, float]:
     """
     High/low of 1m bars since the last check. `strict` (first check of a new
     trade) excludes the bar containing the signal time so pre-entry wicks
     can't trigger SL/TP.
+    [v9.2.1] With `last_bar_ts` (newest bar already processed) the window is
+    bar-based: every bar from that one onward is included, so bars that a
+    lagging feed delivers late are never skipped (the wall-clock window of
+    v9.1 dropped them).
     """
     if not bars: return last, last
-    cutoff = since_ts if strict else since_ts - 60
+    if last_bar_ts is not None:
+        cutoff = last_bar_ts
+    else:
+        cutoff = since_ts if strict else since_ts - 60
     sel = [b for b in bars if b[0] >= cutoff]
     if not sel: return last, last
     return max(max(b[1] for b in sel), last), min(min(b[2] for b in sel), last)
@@ -2522,9 +2607,11 @@ def check_open_trades_for_pair(pair_key: str, last: float, atr_4h: float = 0.0, 
         direction = trade["direction"]; entry = trade["entry"]
         since = trade.get("last_check_ts"); strict = since is None
         if strict: since = _trade_open_ts(trade)
-        hi, lo = _window_hilo(bars, since, last, strict)
+        hi, lo = _window_hilo(bars, since, last, strict, trade.get("last_bar_ts"))
         events = evaluate_trade_tick(trade, last, hi, lo, atr_4h, pm)
         trade["last_check_ts"] = now_ts
+        if bars:   # never below the entry time → pre-entry bars stay excluded
+            trade["last_bar_ts"] = max(trade.get("last_bar_ts") or _trade_open_ts(trade), bars[-1][0])
         closed_now = False
         for ev in events:
             if ev[0] == "partial":
@@ -2593,9 +2680,11 @@ def check_shadow_trades_for_pair(pair_key: str, last: float, atr_4h: float = 0.0
     for key, trade in trades.items():
         since = trade.get("last_check_ts"); strict = since is None
         if strict: since = _trade_open_ts(trade)
-        hi, lo = _window_hilo(bars, since, last, strict)
+        hi, lo = _window_hilo(bars, since, last, strict, trade.get("last_bar_ts"))
         events = evaluate_trade_tick(trade, last, hi, lo, atr_4h, pm)
         trade["last_check_ts"] = now_ts
+        if bars:   # never below the entry time → pre-entry bars stay excluded
+            trade["last_bar_ts"] = max(trade.get("last_bar_ts") or _trade_open_ts(trade), bars[-1][0])
         closed_now = False
         age_h = (now_ts - _trade_open_ts(trade)) / 3600
         if not any(e[0] == "close" for e in events) and age_h > SHADOW_MAX_AGE_H:
@@ -2813,7 +2902,9 @@ def _basis_status_line() -> str:
         b = items.get(pk)
         if b:
             age = int((time.time() - b["ts"]) / 60)
-            out += f"\n{PAIRS_CFG[pk]['pair_name']} basis     : {b['basis']:+.2f} (GC=F→spot, {age}m ago)"
+            dl = b.get("yahoo_delay_min")
+            dtxt = f", Yahoo lag {dl:.0f}m" if dl is not None else ""
+            out += f"\n{PAIRS_CFG[pk]['pair_name']} basis     : {b['basis']:+.2f} (GC=F→spot, {age}m ago{dtxt})"
         else:
             out += f"\n{PAIRS_CFG[pk]['pair_name']} basis     : not measured yet"
     return out
@@ -3301,6 +3392,10 @@ def scan() -> None:
         for pk in PAIR_KEYS:
             candle_data[pk]["ec"]=fetch_slot_cached(pk,"1h",100,critical=True)
             candle_data[pk]["m15"]=fetch_slot_cached(pk,"15min",20,critical=True)
+        # [A-3a] gold basis right after the critical calls (6 + 1 ≤ 8 credits),
+        # before HTF, so it never waits on the limiter.
+        basis_live={pk: measure_basis_at_scan(pk, candle_data[pk].get("ec"))
+                    for pk in PAIR_KEYS if pk in PRICE_BASIS_PAIRS}
         # [P3-6] interval-major order: every pair's 4H before any Daily/Weekly
         for key, iv, cnt in HTF_SPECS:
             for pk in PAIR_KEYS:
@@ -3312,9 +3407,9 @@ def scan() -> None:
         live_prices={}
         for pk in PAIR_KEYS:
             if pk in PRICE_BASIS_PAIRS:
-                # [A-3] Gate-5 price = Twelve Data spot (forming 1H close); also
-                # re-measures the GC=F basis used by the price monitor.
-                live_prices[pk]=measure_basis_at_scan(pk, candle_data[pk].get("ec"))
+                # [A-3] Gate-5 price = Twelve Data spot (forming 1H close), measured
+                # above together with the GC=F basis used by the price monitor.
+                live_prices[pk]=basis_live.get(pk)
             else:
                 live_prices[pk]=get_current_price(pk)[0]      # unchanged v9.1 path
 
